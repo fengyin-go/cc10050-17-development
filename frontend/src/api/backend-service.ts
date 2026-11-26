@@ -1,6 +1,14 @@
 import { request } from './client'
 import { moduleMeta } from '@/data/modules'
-import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
+import type {
+  ActionResult,
+  EntryRow,
+  HandoverResult,
+  OverviewResult,
+  PageResult,
+  RecoverySnapshot,
+  ReviewQueueResult,
+} from '@/data/types'
 
 export { moduleMeta }
 
@@ -59,3 +67,44 @@ export async function loadOverview(): Promise<OverviewResult> {
   if (!response.ok) throw new Error('运营概览读取失败')
   return await response.json()
 }
+
+export async function loadHandover(entryId: number): Promise<HandoverResult> {
+  const response = await request(`/api/failure_quarantine/${entryId}/handover`)
+  if (!response.ok) throw new Error('处置交接单读取失败')
+  return await response.json()
+}
+
+export async function loadRecovery(fingerprint: string): Promise<RecoverySnapshot> {
+  const response = await request(`/api/recovery/${encodeURIComponent(fingerprint)}`)
+  if (!response.ok) throw new Error('恢复回执数据读取失败')
+  return await response.json()
+}
+
+export async function loadReviewQueue(): Promise<ReviewQueueResult> {
+  const response = await request('/api/match_review/queue')
+  if (!response.ok) throw new Error('待复核队列读取失败')
+  return await response.json()
+}
+
+export async function claimReview(
+  entryId: number,
+  role: string,
+  fingerprint: string,
+): Promise<ActionResult & Record<string, unknown>> {
+  const response = await request(`/api/match_review/${entryId}/claim`, {
+    method: 'POST',
+    body: JSON.stringify({ role, fingerprint }),
+  })
+  return await response.json()
+}
+
+export async function withdrawReview(
+  entryId: number,
+): Promise<ActionResult & Record<string, unknown>> {
+  const response = await request(`/api/match_review/${entryId}/withdraw`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  })
+  return await response.json()
+}
+

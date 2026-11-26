@@ -60,6 +60,15 @@
             >
               {{ action }}
             </button>
+            <button
+              v-if="isRecoveryModule"
+              class="link"
+              type="button"
+              :data-testid="`inspect-${row.id}`"
+              @click="inspectRecovery(row)"
+            >
+              {{ meta.key === 'failure_quarantine' ? '处置交接单' : '恢复回执' }}
+            </button>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -69,6 +78,51 @@
         </tr>
       </tbody>
     </table>
+
+    <section v-if="isRecoveryModule" class="recovery-panel" data-testid="recovery-panel">
+      <header class="recovery-head">
+        <h3>{{ meta.key === 'failure_quarantine' ? '处置交接单' : '恢复回执数据' }}</h3>
+        <span v-if="inspectedFingerprint" class="recovery-fp">隔离指纹：{{ inspectedFingerprint }}</span>
+      </header>
+
+      <div v-if="meta.key === 'match_review'" class="recovery-actions">
+        <span v-if="claimFeedback" class="recovery-feedback" data-testid="claim-feedback">{{ claimFeedback }}</span>
+        <button class="btn" type="button" data-testid="claim-queue" @click="claimFromQueue" :disabled="!selectedReview">
+          认领所选复核
+        </button>
+        <button class="btn ghost" type="button" data-testid="withdraw-review" @click="withdrawSelected" :disabled="!selectedReview">
+          人工退出
+        </button>
+      </div>
+
+      <article v-if="handover" class="recovery-card" data-testid="handover-card">
+        <p><strong>认领人：</strong>{{ handover.claimant }}（{{ handover.claimed_by || '无处置方' }}）</p>
+        <p><strong>剩余动作：</strong>{{ handover.remaining_actions.length ? handover.remaining_actions.join('、') : '已办结，无剩余动作' }}</p>
+        <p><strong>实际生效恢复结果：</strong>{{ handover.final_status }}</p>
+        <p><strong>当次失败数据：</strong>{{ handover.last_failure?.detail || '无' }}</p>
+      </article>
+
+      <article v-if="recovery" class="recovery-card" data-testid="recovery-card">
+        <p><strong>处置状态：</strong>{{ recovery.state }}｜<strong>最终处置状态：</strong>{{ recovery.final_status || '处理中' }}</p>
+        <p><strong>处置资格：</strong>{{ recovery.eligibility_owner || '未占用' }}（{{ recovery.holder || '—' }}）</p>
+        <p><strong>能否回到自动恢复：</strong>{{ recovery.auto_recovery_available ? '可以' : '不可以' }}</p>
+        <p><strong>恢复回执：</strong></p>
+        <ul class="receipt-list">
+          <li v-for="receipt in recovery.receipts" :key="receipt.id" :data-testid="`receipt-${receipt.id}`">
+            #{{ receipt.id }} {{ receipt.ok ? '成功' : '失败' }} · {{ receipt.detail }}
+            <span v-if="receipt.effective">（实际生效）</span>
+          </li>
+          <li v-if="!recovery.receipts.length" class="empty-state">暂无回执</li>
+        </ul>
+        <p><strong>恢复产物：</strong>
+          <span v-if="recovery.artifact" :data-testid="`artifact-${recovery.artifact.id}`">
+            #{{ recovery.artifact.id }} · {{ recovery.artifact.kind }} ·
+            {{ recovery.artifact.handed_back ? '已交回样本' : '待交回' }}
+          </span>
+          <span v-else>暂无有效产物</span>
+        </p>
+      </article>
+    </section>
 
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
@@ -97,16 +151,24 @@
 import { computed, onMounted, ref } from 'vue'
 
 import {
+  claimReview,
   createEntry,
   downloadEntries,
   listEntries,
+  loadHandover,
+  loadRecovery,
+  loadReviewQueue,
   moduleMeta,
   runAction as applyAction,
+  withdrawReview,
 } from '@/api/backend-service'
-import type { EntryRow } from '@/data/types'
+import type { EntryRow, HandoverResult, RecoverySnapshot, ReviewQueueItem } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const isRecoveryModule = computed(
+  () => meta.key === 'failure_quarantine' || meta.key === 'match_review',
+)
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
@@ -115,6 +177,12 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const handover = ref<HandoverResult | null>(null)
+const recovery = ref<RecoverySnapshot | null>(null)
+const inspectedFingerprint = ref('')
+const queue = ref<ReviewQueueItem[]>([])
+const selectedReview = ref<ReviewQueueItem | null>(null)
+const claimFeedback = ref('')
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -165,12 +233,74 @@ async function submitCreate() {
   }
 }
 
+function rowFingerprint(row: EntryRow): string {
+  return String(row['来源指纹'] ?? row['样本指纹'] ?? row['匹配记录'] ?? '')
+}
+
+async function inspectRecovery(row: EntryRow) {
+  errorMessage.value = ''
+  handover.value = null
+  recovery.value = null
+  try {
+    if (meta.key === 'failure_quarantine') {
+      handover.value = await loadHandover(Number(row.id))
+      inspectedFingerprint.value = handover.value.fingerprint
+    } else {
+      const fingerprint = rowFingerprint(row)
+      inspectedFingerprint.value = fingerprint
+      if (fingerprint) recovery.value = await loadRecovery(fingerprint)
+    }
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '恢复回执读取失败'
+  }
+}
+
+async function claimFromQueue() {
+  const item = selectedReview.value
+  if (!item) return
+  claimFeedback.value = ''
+  try {
+    const result = await claimReview(item.id, '数据治理专员', item.fingerprint)
+    claimFeedback.value = result.message
+    inspectedFingerprint.value = item.fingerprint
+    recovery.value = await loadRecovery(item.fingerprint)
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '认领失败'
+  }
+}
+
+async function withdrawSelected() {
+  const item = selectedReview.value
+  if (!item) return
+  claimFeedback.value = ''
+  try {
+    const result = await withdrawReview(item.id)
+    claimFeedback.value = String(result.message)
+    if (item.fingerprint) recovery.value = await loadRecovery(item.fingerprint)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '人工退出失败'
+  }
+}
+
 async function runAction(action: string, row: EntryRow) {
   errorMessage.value = ''
   try {
+    if (meta.key === 'match_review') {
+      selectedReview.value = queue.value.find((item) => item.id === Number(row.id)) ?? {
+        record_number: String(row['记录编号'] ?? ''),
+        id: Number(row.id),
+        fingerprint: rowFingerprint(row),
+        claimant: String(row['认领人'] ?? row['复核角色'] ?? ''),
+        remaining_actions: [],
+        claimable: true,
+        recovery: null,
+      }
+    }
     const result = await applyAction(meta.key, Number(row.id), action)
     if (!result.ok) throw new Error(result.message)
     await reload()
+    if (isRecoveryModule.value) await inspectRecovery(row)
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '操作失败'
   }
@@ -182,6 +312,9 @@ async function reload() {
     const payload = await listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
+    if (meta.key === 'match_review') {
+      queue.value = (await loadReviewQueue()).items
+    }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
   }
